@@ -10,6 +10,8 @@ import requests
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import asyncio
+import aiohttp
 
 load_dotenv()
 
@@ -259,24 +261,64 @@ def aggregate_notifications():
         
     return notifications
 
-
+async def fetch(session, url):
+    async with session.get(url, headers=HEADERS) as response:
+        return await response.json()
 async def bids_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        notifications = []
-        orders_response = requests.request("GET", "https://api.predict.fun/v1/orders", headers=HEADERS).json()
-        orders_r = orders_response["data"]
-        for o in orders_r:
-            market_id = o["marketId"]
-            r = requests.get(f"https://api.predict.fun/v1/markets/{market_id}/orderbook", headers=HEADERS)
-            orderbook_data = r.json()["data"]
-            titleRequest = requests.get(f"https://api.predict.fun/v1/markets/{market_id}", headers=HEADERS)
+    notifications = []
+    async with aiohttp.ClientSession() as session:
+        orders_data = await fetch(session, "https://api.predict.fun/v1/orders")
+        orders = orders_data.get("data", [])
+        if not orders:
+            await update.message.reply_text("Ордеров не найдено.")
+            return
+        market_ids = list(set(o["marketId"] for o in orders))
+        orderbook_tasks = [fetch(session, f"https://api.predict.fun/v1/markets/{m_id}/orderbook") for m_id in market_ids]
+        market_info_tasks = [fetch(session, f"https://api.predict.fun/v1/markets/{m_id}") for m_id in market_ids]
+        results = await asyncio.gather(*orderbook_tasks, *market_info_tasks)
+        n = len(market_ids)
+        orderbooks = {market_ids[i]: results[i]["data"] for i in range(n)}
+        titles = {market_ids[i]: results[i+n]["data"] for i in range(n)}
+        for o in orders:
+            m_id = o["marketId"]
+            orderbook_data = orderbooks[m_id]
+            title_data = titles[m_id]
+            question = title_data["question"]
             analyze = analyze_order(o, orderbook_data)
-            if analyze["likely_outcome"] == 'YES':
-                highest_bid = orderbook_data["bids"][0][0]
+            maker_amt = float(o["order"]["makerAmount"])
+            taker_amt = float(o["order"]["takerAmount"])
+            my_price = maker_amt / taker_amt
+            my_shares = taker_amt / 1e18
+            my_usd = my_price * my_shares
+            if analyze["likely_outcome"] == "YES":
+                bids = orderbook_data.get("bids", [])
             else:
                 no_book = transform_to_no_orderbook(orderbook_data, precision=3)
-                highest_bid = no_book['no_bids'][0][0] 
-            notifications.append(f"<code>{titleRequest.json()["data"]["question"]}</code> \n<b>Value: ${float(o["order"]["makerAmount"])/1000000000000000000} | Order: {float(o["order"]["makerAmount"])/float(o["order"]["takerAmount"]) * 100}¢ | Bid: {highest_bid * 100}¢</b>\n\n")
-        await update.message.reply_text("".join(notifications), parse_mode="HTML")
+                bids = no_book.get("no_bids", [])
+            higher = [b for b in bids if b[0] > my_price]
+            lower = [b for b in bids if b[0] <= my_price][:3]
+            quote_lines = []
+            for price, shares in higher:
+                quote_lines.append(f"{price*100:>6.2f}¢ | {shares:>8.2f} sh | ${price * shares:>8.2f}")
+            
+            quote_lines.append(f"<b>▶ {my_price*100:>6.2f}¢ | {my_shares:>8.2f} sh | ${my_usd:>8.2f} ← YOUR ORDER</b>")
+            
+            for price, shares in lower:
+                quote_lines.append(f"{price*100:>6.2f}¢ | {shares:>8.2f} sh | ${price * shares:>8.2f}")
+            
+            quote_text = "\n".join(quote_lines)
+            notifications.append(
+                f"<code>{question}</code>\n"
+                f"<blockquote>{quote_text}</blockquote>\n\n"
+            )
+    full_message = "".join(notifications)
+    if len(full_message) > 4000:
+        for i in range(0, len(full_message), 4000):
+            await update.message.reply_text(full_message[i:i+4000], parse_mode="HTML")
+    else:
+        await update.message.reply_text(full_message, parse_mode="HTML")
+
+
 
 
 
