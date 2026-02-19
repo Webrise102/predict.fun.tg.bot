@@ -12,17 +12,89 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 import asyncio
 import aiohttp
+import jwt as pyjwt
+from predict_sdk import OrderBuilder, ChainId, OrderBuilderOptions
 
 load_dotenv()
 
+ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
 ORDERS_URL = "https://api.predict.fun/v1/orders"
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
 RENDER_PORT = int(os.getenv("PORT", "10000"))
 
-HEADERS = {
-    "Authorization": f"Bearer {os.getenv('JWT', '')}",
-    "x-api-key": os.getenv("API", ""),
-}
+# ДОБАВИТЬ вместо них:
+_PRIVATE_KEY    = os.getenv("WALLET_PRIVATE_KEY", "")
+PREDICT_API_KEY = os.getenv("API", "")
+PREDICT_ACCOUNT = os.getenv("PREDICT_ACCOUNT", "")
+PREDICT_BASE_URL = os.getenv("PREDICT_BASE_URL", "https://api.predict.fun")
+
+class JWTManager:
+    REFRESH_BEFORE_EXPIRY = 5 * 60
+
+    def __init__(self, private_key, api_key, predict_account=""):
+        self._private_key     = private_key
+        self._api_key         = api_key
+        self._predict_account = predict_account
+        self._token           = ""
+        self._lock            = asyncio.Lock()
+
+    async def get_headers(self) -> dict:
+        await self._ensure_valid()
+        h = {"Authorization": f"Bearer {self._token}"}
+        if self._api_key:
+            h["x-api-key"] = self._api_key
+        return h
+
+    async def force_refresh(self):
+        async with self._lock:
+            self._token = await asyncio.to_thread(self._fetch_jwt)
+
+    async def initialize(self):
+        await self.force_refresh()
+
+    async def _ensure_valid(self):
+        if not self._token or self._is_expiring_soon():
+            async with self._lock:
+                if not self._token or self._is_expiring_soon():
+                    self._token = await asyncio.to_thread(self._fetch_jwt)
+
+    def _is_expiring_soon(self) -> bool:
+        try:
+            payload   = pyjwt.decode(self._token, options={"verify_signature": False}, algorithms=["HS256", "RS256"])
+            remaining = payload.get("exp", 0) - time.time()
+            return remaining < self.REFRESH_BEFORE_EXPIRY
+        except Exception:
+            return True
+
+    # ЗАМЕНИТЬ НА:
+    def _fetch_jwt(self) -> str:
+        from predict_sdk import OrderBuilder, ChainId, OrderBuilderOptions
+
+        base_headers = {"x-api-key": self._api_key} if self._api_key else {}
+
+        builder = OrderBuilder.make(
+            ChainId.BNB_MAINNET,
+            self._private_key,
+            OrderBuilderOptions(predict_account=self._predict_account) if self._predict_account else None,
+        )
+
+        msg = requests.get(f"{PREDICT_BASE_URL}/v1/auth/message", headers=base_headers, timeout=15)
+        msg.raise_for_status()
+        message = msg.json()["data"]["message"]
+
+        signature = builder.sign_predict_account_message(message)
+
+        body = {
+            "signer":    self._predict_account if self._predict_account else builder.signer.address,
+            "message":   message,
+            "signature": signature,
+        }
+
+        resp = requests.post(f"{PREDICT_BASE_URL}/v1/auth", json=body, headers=base_headers, timeout=15)
+        resp.raise_for_status()
+        token = resp.json()["data"]["token"]
+        return token
+jwt_manager = JWTManager(_PRIVATE_KEY, PREDICT_API_KEY, PREDICT_ACCOUNT)
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -119,8 +191,10 @@ def _normalize_order(item: dict) -> dict:
     return merged
 
 
-def fetch_open_limit_orders() -> list[dict]:
-    response = requests.get(ORDERS_URL, headers=HEADERS, timeout=30)
+# ЗАМЕНИТЬ:
+async def fetch_open_limit_orders() -> list[dict]:
+    headers  = await jwt_manager.get_headers()
+    response = requests.get(ORDERS_URL, headers=headers, timeout=30)
     response.raise_for_status()
 
     result = response.json()
@@ -185,9 +259,11 @@ def format_orders_message(orders: list[dict]) -> str:
 
 
 async def orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return  # молча игнорируем чужие запросы
     try:
         await update.message.reply_text("Loading limit orders...")
-        orders = fetch_open_limit_orders()
+        orders = await fetch_open_limit_orders()
         await update.message.reply_text(format_orders_message(orders), parse_mode="HTML")
     except Exception as exc:
         await update.message.reply_text(f"Error: {exc}")
@@ -233,12 +309,13 @@ def aggregate_notifications():
     global prev_highest_bids
     notifications = []
     
-    orders_response = requests.request("GET", "https://api.predict.fun/v1/orders", headers=HEADERS).json()
+    headers = asyncio.get_event_loop().run_until_complete(jwt_manager.get_headers())
+    orders_response = requests.get(f"{PREDICT_BASE_URL}/v1/orders", headers=headers).json()
     orders_r = orders_response["data"]
     
     for o in orders_r:
         market_id = o["marketId"]
-        r = requests.get(f"https://api.predict.fun/v1/markets/{market_id}/orderbook", headers=HEADERS)
+        r = requests.get(f"{PREDICT_BASE_URL}/v1/markets/{market_id}/orderbook", headers=headers)
         orderbook_data = r.json()["data"]
         analyze = analyze_order(o, orderbook_data)
         if analyze["likely_outcome"] == 'YES':
@@ -261,10 +338,19 @@ def aggregate_notifications():
         
     return notifications
 
+# ДОБАВИТЬ:
 async def fetch(session, url):
-    async with session.get(url, headers=HEADERS) as response:
+    headers = await jwt_manager.get_headers()
+    async with session.get(url, headers=headers) as response:
+        if response.status == 401:
+            await jwt_manager.force_refresh()
+            headers = await jwt_manager.get_headers()
+            async with session.get(url, headers=headers) as r2:
+                return await r2.json()
         return await response.json()
 async def bids_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return  # молча игнорируем чужие запросы
     notifications = []
     async with aiohttp.ClientSession() as session:
         orders_data = await fetch(session, "https://api.predict.fun/v1/orders")
@@ -330,7 +416,8 @@ def main() -> None:
 
     start_keepalive_server()
     delete_webhook_if_needed()
-
+    # ДОБАВИТЬ перед app = ApplicationBuilder()...:
+    asyncio.run(jwt_manager.initialize())
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("orders", orders_command))

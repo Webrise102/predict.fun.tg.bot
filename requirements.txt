@@ -2,3 +2,4 @@ python-telegram-bot==21.10
 aiohttp==3.11.12
 requests==2.32.3
 python-dotenv==1.0.1
+eth-account==0.13.4
