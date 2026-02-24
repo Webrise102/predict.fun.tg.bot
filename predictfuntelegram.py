@@ -447,7 +447,7 @@ async def bids_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(full_message, parse_mode="HTML")
 
-async def monitor_single_bid_above(context: ContextTypes.DEFAULT_TYPE):
+async def monitor_single_bid_above(application):
     """Фоновая задача: уведомляет если выше моего bid только 1 bid."""
     try:
         async with aiohttp.ClientSession() as session:
@@ -474,7 +474,6 @@ async def monitor_single_bid_above(context: ContextTypes.DEFAULT_TYPE):
 
             for o in orders:
                 order_id = o.get("id") or o.get("hash") or str(o)
-                print(f"Order id: {order_id}")
                 active_order_ids.add(order_id)
                 m_id = o["marketId"]
                 orderbook_data = orderbooks[m_id]
@@ -524,7 +523,7 @@ async def monitor_single_bid_above(context: ContextTypes.DEFAULT_TYPE):
                         ]
                     ])
 
-                    await context.bot.send_message(
+                    await application.bot.send_message(
                         chat_id=ALLOWED_USER_ID,
                         text=msg,
                         parse_mode="HTML",
@@ -536,7 +535,6 @@ async def monitor_single_bid_above(context: ContextTypes.DEFAULT_TYPE):
             for oid in list(_notified_orders.keys()):
                 if oid not in active_order_ids:
                     del _notified_orders[oid]
-            print("done async")
 
     except Exception as exc:
         print(f"[monitor_single_bid_above] error: {exc}")
@@ -613,17 +611,21 @@ def main() -> None:
     delete_webhook_if_needed()
     # ДОБАВИТЬ перед app = ApplicationBuilder()...:
     asyncio.run(jwt_manager.initialize())
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    async def _post_init(application):
+        async def _monitor_loop():
+            while True:
+                await monitor_single_bid_above(application)
+                await asyncio.sleep(10)
+        asyncio.create_task(_monitor_loop())
+
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("orders", orders_command))
     app.add_handler(CommandHandler("bids", bids_command))
     app.add_handler(CallbackQueryHandler(cancel_one_callback, pattern=r"^cancel_one:"))
     app.add_handler(CallbackQueryHandler(cancel_all_callback, pattern=r"^cancel_all$"))
-    # Мониторинг каждые 60 секунд
-    app.job_queue.run_repeating(monitor_single_bid_above, interval=10, first=1)
 
     print("Bot started")
-    asyncio.set_event_loop(asyncio.new_event_loop())
     app.run_polling(drop_pending_updates=True)
 
 
