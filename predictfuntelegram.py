@@ -476,7 +476,6 @@ async def monitor_single_bid_above(application):
 
             for o in orders:
                 order_id = o.get("id") or o.get("hash") or str(o)
-                print("fOrder:{o}")
                 active_order_ids.add(order_id)
                 m_id = o["marketId"]
                 orderbook_data = orderbooks[m_id]
@@ -505,10 +504,9 @@ async def monitor_single_bid_above(application):
                     elapsed = time.time() - _notified_orders[order_id]
                     if elapsed >= NOTIFY_RESET_SECONDS:
                         del _notified_orders[order_id]
-                print("checking length 1...")
 
                 # Отправляем уведомление если выше ровно 1 bid и ещё не уведомляли
-                if len(higher) == 3 and order_id not in _notified_orders:
+                if len(higher) == 1 and order_id not in _notified_orders:
                     question = titles[m_id].get("question", f"Market {m_id}")
                     top_bid_price, top_bid_shares = higher[0]
                     msg = (
@@ -539,10 +537,9 @@ async def monitor_single_bid_above(application):
                     elapsed = time.time() - _notified_zero_above[order_id]
                     if elapsed >= NOTIFY_RESET_SECONDS:
                         del _notified_zero_above[order_id]
-                print("checking length 2...")
 
                 # Уведомление если выше 0 bids
-                if len(higher) == 2 and order_id not in _notified_zero_above:
+                if len(higher) == 0 and order_id not in _notified_zero_above:
                     question = titles[m_id].get("question", f"Market {m_id}")
                     msg = (
                         f"🔴 <b>Вы первый в очереди! Нет bids выше вашего.</b>\n\n"
@@ -557,7 +554,6 @@ async def monitor_single_bid_above(application):
                             InlineKeyboardButton("🗑 Отменить все", callback_data="cancel_all"),
                         ]
                     ])
-                    print("sending")
                     await application.bot.send_message(
                         chat_id=ALLOWED_USER_ID,
                         text=msg,
