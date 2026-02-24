@@ -346,6 +346,8 @@ def analyze_order(order_data, orderbook):
     }
 prev_highest_bids = {}
 _notified_orders: dict[str, float] = {}
+_notified_zero_above: dict[str, float] = {}  # ← добавить
+
 NOTIFY_RESET_SECONDS = 30 * 60  # 30 минут
 
 def aggregate_notifications():
@@ -474,6 +476,7 @@ async def monitor_single_bid_above(application):
 
             for o in orders:
                 order_id = o.get("id") or o.get("hash") or str(o)
+                print("fOrder:{o}")
                 active_order_ids.add(order_id)
                 m_id = o["marketId"]
                 orderbook_data = orderbooks[m_id]
@@ -502,9 +505,10 @@ async def monitor_single_bid_above(application):
                     elapsed = time.time() - _notified_orders[order_id]
                     if elapsed >= NOTIFY_RESET_SECONDS:
                         del _notified_orders[order_id]
+                print("checking length 1...")
 
                 # Отправляем уведомление если выше ровно 1 bid и ещё не уведомляли
-                if len(higher) == 1 and order_id not in _notified_orders:
+                if len(higher) == 3 and order_id not in _notified_orders:
                     question = titles[m_id].get("question", f"Market {m_id}")
                     top_bid_price, top_bid_shares = higher[0]
                     msg = (
@@ -530,11 +534,45 @@ async def monitor_single_bid_above(application):
                         reply_markup=keyboard,
                     )
                     _notified_orders[order_id] = time.time()
+                # Сбрасываем флаг для "0 выше" если прошло 30 минут
+                if order_id in _notified_zero_above:
+                    elapsed = time.time() - _notified_zero_above[order_id]
+                    if elapsed >= NOTIFY_RESET_SECONDS:
+                        del _notified_zero_above[order_id]
+                print("checking length 2...")
+
+                # Уведомление если выше 0 bids
+                if len(higher) == 2 and order_id not in _notified_zero_above:
+                    question = titles[m_id].get("question", f"Market {m_id}")
+                    msg = (
+                        f"🔴 <b>Вы первый в очереди! Нет bids выше вашего.</b>\n\n"
+                        f"<code>{html.escape(question)}</code>\n\n"
+                        f"My bid: {my_price * 100:.2f}¢ | {my_shares:.2f} sh | ${my_usd:.2f}\n"
+                        f"Total on {my_price * 100:.2f}¢: {same_level_shares:.2f} sh | ${same_level_usd:.2f}\n"
+                        f"Order ID: <code>{html.escape(str(order_id))}</code>"
+                    )
+                    keyboard = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("❌ Отменить этот ордер", callback_data=f"cancel_one:{order_id}"),
+                            InlineKeyboardButton("🗑 Отменить все", callback_data="cancel_all"),
+                        ]
+                    ])
+                    print("sending")
+                    await application.bot.send_message(
+                        chat_id=ALLOWED_USER_ID,
+                        text=msg,
+                        parse_mode="HTML",
+                        reply_markup=keyboard,
+                    )
+                    _notified_zero_above[order_id] = time.time()
 
             # Чистим словарь от отменённых ордеров
             for oid in list(_notified_orders.keys()):
                 if oid not in active_order_ids:
                     del _notified_orders[oid]
+            for oid in list(_notified_zero_above.keys()):  # ← добавить
+                if oid not in active_order_ids:
+                    del _notified_zero_above[oid]
 
     except Exception as exc:
         print(f"[monitor_single_bid_above] error: {exc}")
@@ -615,7 +653,7 @@ def main() -> None:
         async def _monitor_loop():
             while True:
                 await monitor_single_bid_above(application)
-                await asyncio.sleep(10)
+                await asyncio.sleep(5)
         asyncio.create_task(_monitor_loop())
 
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
