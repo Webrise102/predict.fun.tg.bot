@@ -14,6 +14,9 @@ import asyncio
 import aiohttp
 import jwt as pyjwt
 from predict_sdk import OrderBuilder, ChainId, OrderBuilderOptions
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import CallbackQueryHandler
+from predict_sdk import Order, CancelOrdersOptions, OrderBuilderOptions
 
 load_dotenv()
 
@@ -29,7 +32,7 @@ PREDICT_ACCOUNT = os.getenv("PREDICT_ACCOUNT", "")
 PREDICT_BASE_URL = os.getenv("PREDICT_BASE_URL", "https://api.predict.fun")
 
 class JWTManager:
-    REFRESH_BEFORE_EXPIRY = 5 * 60
+    REFRESH_BEFORE_EXPIRY = 1 * 60
 
     def __init__(self, private_key, api_key, predict_account=""):
         self._private_key     = private_key
@@ -95,6 +98,44 @@ class JWTManager:
         token = resp.json()["data"]["token"]
         return token
 jwt_manager = JWTManager(_PRIVATE_KEY, PREDICT_API_KEY, PREDICT_ACCOUNT)
+def _make_order_builder():
+    from predict_sdk import OrderBuilder, ChainId, OrderBuilderOptions
+    opts = OrderBuilderOptions(predict_account=PREDICT_ACCOUNT) if PREDICT_ACCOUNT else None
+    return OrderBuilder.make(ChainId.BNB_MAINNET, _PRIVATE_KEY, opts)
+
+def _raw_to_order(item: dict) -> tuple[Order, bool, bool]:
+    """Возвращает (Order, is_neg_risk, is_yield_bearing)."""
+    raw = item.get("order", item)
+    is_neg_risk = item.get("isNegRisk", False)
+    is_yield_bearing = item.get("isYieldBearing", False)
+    CAMEL = {
+        "tokenId": "token_id", "makerAmount": "maker_amount",
+        "takerAmount": "taker_amount", "feeRateBps": "fee_rate_bps",
+        "signatureType": "signature_type",
+    }
+    FIELDS = {"salt","maker","signer","taker","token_id","maker_amount",
+              "taker_amount","expiration","nonce","fee_rate_bps","side","signature_type"}
+    mapped = {CAMEL.get(k, k): v for k, v in raw.items()}
+    return Order(**{k: v for k, v in mapped.items() if k in FIELDS}), is_neg_risk, is_yield_bearing
+
+async def cancel_orders_raw(raw_items: list[dict]) -> bool:
+    """Отменяет список ордеров (в формате ответа API). Возвращает True если всё ок."""
+    builder = await asyncio.to_thread(_make_order_builder)
+    groups: dict[tuple, list[Order]] = {}
+    for item in raw_items:
+        order, neg, yb = _raw_to_order(item)
+        key = (neg, yb)
+        groups.setdefault(key, []).append(order)
+
+    all_ok = True
+    for (neg, yb), orders in groups.items():
+        result = await asyncio.to_thread(
+            builder.cancel_orders, orders,
+            CancelOrdersOptions(is_neg_risk=neg, is_yield_bearing=yb),
+        )
+        if not result.success:
+            all_ok = False
+    return all_ok
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -304,6 +345,8 @@ def analyze_order(order_data, orderbook):
         "token_id": token_id
     }
 prev_highest_bids = {}
+_notified_orders: dict[str, float] = {}
+NOTIFY_RESET_SECONDS = 1 * 60  # 30 минут
 
 def aggregate_notifications():
     global prev_highest_bids
@@ -404,12 +447,164 @@ async def bids_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(full_message, parse_mode="HTML")
 
+async def monitor_single_bid_above(context: ContextTypes.DEFAULT_TYPE):
+    """Фоновая задача: уведомляет если выше моего bid только 1 bid."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            orders_data = await fetch(session, f"{PREDICT_BASE_URL}/v1/orders")
+            orders = orders_data.get("data", [])
+            if not orders:
+                return
+
+            market_ids = list(set(o["marketId"] for o in orders))
+            orderbook_tasks = [
+                fetch(session, f"{PREDICT_BASE_URL}/v1/markets/{m_id}/orderbook")
+                for m_id in market_ids
+            ]
+            market_info_tasks = [
+                fetch(session, f"{PREDICT_BASE_URL}/v1/markets/{m_id}")
+                for m_id in market_ids
+            ]
+            results = await asyncio.gather(*orderbook_tasks, *market_info_tasks)
+            n = len(market_ids)
+            orderbooks = {market_ids[i]: results[i]["data"] for i in range(n)}
+            titles = {market_ids[i]: results[i + n]["data"] for i in range(n)}
+
+            active_order_ids = set()
+
+            for o in orders:
+                order_id = o.get("id") or o.get("hash") or str(o)
+                print(f"Order id: {order_id}")
+                active_order_ids.add(order_id)
+                m_id = o["marketId"]
+                orderbook_data = orderbooks[m_id]
+
+                analyze = analyze_order(o, orderbook_data)
+                maker_amt = float(o["order"]["makerAmount"])
+                taker_amt = float(o["order"]["takerAmount"])
+                my_price = maker_amt / taker_amt
+                my_shares = taker_amt / 1e18
+                my_usd = my_price * my_shares
+
+                if analyze["likely_outcome"] == "YES":
+                    bids = orderbook_data.get("bids", [])
+                else:
+                    no_book = transform_to_no_orderbook(orderbook_data, precision=3)
+                    bids = no_book.get("no_bids", [])
+
+                higher = [b for b in bids if b[0] > my_price]
+                my_price_rounded = round(my_price, 3)
+                same_level = next((b for b in bids if round(b[0], 3) == my_price_rounded), None)
+                same_level_shares = same_level[1] if same_level else my_shares
+                same_level_usd = my_price * same_level_shares
+
+                # Сбрасываем флаг если прошло 30 минут и ордер всё ещё активен
+                if order_id in _notified_orders:
+                    elapsed = time.time() - _notified_orders[order_id]
+                    if elapsed >= NOTIFY_RESET_SECONDS:
+                        del _notified_orders[order_id]
+
+                # Отправляем уведомление если выше ровно 1 bid и ещё не уведомляли
+                if len(higher) == 6 and order_id not in _notified_orders:
+                    question = titles[m_id].get("question", f"Market {m_id}")
+                    top_bid_price, top_bid_shares = higher[0]
+                    msg = (
+                        f"⚠️ <b>Только 1 bid выше вашего!</b>\n\n"
+                        f"<code>{html.escape(question)}</code>\n\n"
+                        f"Top bid: {top_bid_price * 100:.2f}¢ | {top_bid_shares:.2f} sh | ${top_bid_price * top_bid_shares:.2f}\n"
+                        f"My bid: {my_price * 100:.2f}¢ | {my_shares:.2f} sh | ${my_usd:.2f}\n"
+                        f"Total on: {my_price * 100:.2f}¢ | {same_level_shares:.2f} sh | ${same_level_usd:.2f}\n"
+                        f"Order ID: <code>{html.escape(str(order_id))}</code>"
+                    )
+                    # Формируем inline-клавиатуру
+                    keyboard = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("❌ Отменить этот ордер", callback_data=f"cancel_one:{order_id}"),
+                            InlineKeyboardButton("🗑 Отменить все", callback_data="cancel_all"),
+                        ]
+                    ])
+
+                    await context.bot.send_message(
+                        chat_id=ALLOWED_USER_ID,
+                        text=msg,
+                        parse_mode="HTML",
+                        reply_markup=keyboard,
+                    )
+                    _notified_orders[order_id] = time.time()
+
+            # Чистим словарь от отменённых ордеров
+            for oid in list(_notified_orders.keys()):
+                if oid not in active_order_ids:
+                    del _notified_orders[oid]
+            print("done async")
+
+    except Exception as exc:
+        print(f"[monitor_single_bid_above] error: {exc}")
 
 
 
 
 
 
+async def cancel_one_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return
+
+    order_id = query.data.split(":", 1)[1]
+    await query.edit_message_reply_markup(reply_markup=None)
+
+    try:
+        headers = await jwt_manager.get_headers()
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{PREDICT_BASE_URL}/v1/orders", headers=headers) as r:
+                data = (await r.json()).get("data", [])
+
+        # Ищем нужный ордер по id/hash
+        target = next(
+            (o for o in data if str(o.get("id") or o.get("hash")) == order_id),
+            None,
+        )
+        if target is None:
+            await query.message.reply_text(f"⚠️ Ордер <code>{html.escape(order_id)}</code> не найден.", parse_mode="HTML")
+            return
+
+        ok = await cancel_orders_raw([target])
+        if ok:
+            await query.message.reply_text(f"✅ Ордер <code>{html.escape(order_id)}</code> отменён.", parse_mode="HTML")
+        else:
+            await query.message.reply_text(f"❌ Не удалось отменить ордер <code>{html.escape(order_id)}</code>.", parse_mode="HTML")
+    except Exception as exc:
+        await query.message.reply_text(f"❌ Ошибка: {exc}")
+
+
+async def cancel_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if update.effective_user.id != ALLOWED_USER_ID:
+        return
+
+    await query.edit_message_reply_markup(reply_markup=None)
+    await query.message.reply_text("⏳ Отменяю все ордера...")
+
+    try:
+        headers = await jwt_manager.get_headers()
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{PREDICT_BASE_URL}/v1/orders", headers=headers) as r:
+                data = (await r.json()).get("data", [])
+
+        if not data:
+            await query.message.reply_text("✅ Открытых ордеров нет.")
+            return
+
+        ok = await cancel_orders_raw(data)
+        if ok:
+            await query.message.reply_text(f"✅ Все ордера ({len(data)} шт.) отменены!")
+        else:
+            await query.message.reply_text("⚠️ Некоторые ордера не удалось отменить.")
+    except Exception as exc:
+        await query.message.reply_text(f"❌ Ошибка: {exc}")
 def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN (or TELEGRAM_TOKEN) is not set.")
@@ -422,6 +617,10 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("orders", orders_command))
     app.add_handler(CommandHandler("bids", bids_command))
+    app.add_handler(CallbackQueryHandler(cancel_one_callback, pattern=r"^cancel_one:"))
+    app.add_handler(CallbackQueryHandler(cancel_all_callback, pattern=r"^cancel_all$"))
+    # Мониторинг каждые 60 секунд
+    app.job_queue.run_repeating(monitor_single_bid_above, interval=10, first=1)
 
     print("Bot started")
     asyncio.set_event_loop(asyncio.new_event_loop())
