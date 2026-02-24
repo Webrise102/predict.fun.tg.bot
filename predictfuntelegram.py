@@ -346,7 +346,7 @@ def analyze_order(order_data, orderbook):
     }
 prev_highest_bids = {}
 _notified_orders: dict[str, float] = {}
-NOTIFY_RESET_SECONDS = 1 * 60  # 30 минут
+NOTIFY_RESET_SECONDS = 30 * 60  # 30 минут
 
 def aggregate_notifications():
     global prev_highest_bids
@@ -504,7 +504,7 @@ async def monitor_single_bid_above(application):
                         del _notified_orders[order_id]
 
                 # Отправляем уведомление если выше ровно 1 bid и ещё не уведомляли
-                if len(higher) == 6 and order_id not in _notified_orders:
+                if len(higher) == 1 and order_id not in _notified_orders:
                     question = titles[m_id].get("question", f"Market {m_id}")
                     top_bid_price, top_bid_shares = higher[0]
                     msg = (
