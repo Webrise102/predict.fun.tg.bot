@@ -2,5 +2,5 @@ aiohttp==3.10.7
 predict_sdk==0.0.15
 PyJWT==2.11.0
 python-dotenv==1.2.1
-python-telegram-bot==22.6
+python-telegram-bot[job-queue]==22.6
 Requests==2.32.5
