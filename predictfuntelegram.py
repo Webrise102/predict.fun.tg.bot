@@ -348,7 +348,7 @@ prev_highest_bids = {}
 _notified_orders: dict[str, float] = {}
 _notified_zero_above: dict[str, float] = {}  # ← добавить
 
-NOTIFY_RESET_SECONDS = 30 * 60  # 30 минут
+NOTIFY_RESET_SECONDS = 720 * 60  # 30 минут
 
 def aggregate_notifications():
     global prev_highest_bids
